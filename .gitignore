@@ -1,0 +1,11 @@
+# Python temporary files
+__pycache__/
+*.pyc
+
+# TP2 Specific folders (These should not be on GitHub)
+index/
+tmp/
+
+# OS specific
+.DS_Store
+Thumbs.db
