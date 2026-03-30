@@ -4,11 +4,19 @@ import contextlib
 import heapq
 import time
 import math
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer
 
 from index import InvertedIndexReader, InvertedIndexWriter
 from util import IdMap, sorted_merge_posts_and_tfs
 from compression import StandardPostings, VBEPostings
 from tqdm import tqdm
+
+nltk.download('stopwords', quiet=True)
+
+STOP_WORDS = set(stopwords.words('english'))
+STEMMER = PorterStemmer()
 
 class BSBIIndex:
     """
@@ -89,11 +97,12 @@ class BSBIIndex:
             docname = dir + "/" + filename
             with open(docname, "r", encoding = "utf8", errors = "surrogateescape") as f:
                 content = f.read().split()
-                # Register the doc before the token loop so zero-token docs are still counted in doc_length, N, and avdl
                 doc_id = self.doc_id_map[docname]
                 for token in content:
-                    td_pairs.append((self.term_id_map[token], doc_id))
-
+                    token = token.lower()
+                    if token not in STOP_WORDS:
+                        token = STEMMER.stem(token)
+                        td_pairs.append((self.term_id_map[token], doc_id))
         return td_pairs
 
     def invert_write(self, td_pairs, index):
@@ -167,6 +176,29 @@ class BSBIIndex:
                 curr, postings, tf_list = t, postings_, tf_list_
         merged_index.append(curr, postings, tf_list)
 
+    def preprocess_query(self, query):
+        """
+        A helper method that applies the same preprocessing pipeline used in parse_block to a
+        query string: lowercasing, stopword removal, and stemming.
+
+        Parameters
+        ----------
+        query : str
+            Raw query string.
+
+        Returns
+        -------
+        List[str]
+            List of preprocessed query tokens.
+        """
+        tokens = []
+        for token in query.split():
+            token = token.lower()
+            if token not in STOP_WORDS:
+                token = STEMMER.stem(token)
+                tokens.append(token)
+        return tokens
+
     def retrieve_tfidf(self, query, k = 10):
         """
         Melakukan Ranked Retrieval dengan skema TaaT (Term-at-a-Time).
@@ -206,7 +238,10 @@ class BSBIIndex:
         if len(self.term_id_map) == 0 or len(self.doc_id_map) == 0:
             self.load()
 
-        terms = [self.term_id_map[word] for word in query.split()]
+        terms = []
+        for word in self.preprocess_query(query):
+            if word in self.term_id_map: # only consider terms that exist in the collection
+                terms.append(self.term_id_map[word])
         with InvertedIndexReader(self.index_name, self.postings_encoding, directory=self.output_dir) as merged_index:
 
             scores = {}
@@ -259,7 +294,7 @@ class BSBIIndex:
             avdl = sum(merged_index.doc_length.values()) / N
 
             scores = {}
-            for word in query.split():
+            for word in self.preprocess_query(query):
                 if word not in self.term_id_map:
                     continue
                 term_id = self.term_id_map[word]
