@@ -4,6 +4,7 @@ __pycache__/
 
 # TP2 Specific folders (These should not be on GitHub)
 index/
+index_spimi/
 tmp/
 
 # OS specific
