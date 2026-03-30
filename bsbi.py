@@ -2,7 +2,6 @@ import os
 import pickle
 import contextlib
 import heapq
-import time
 import math
 import nltk
 from nltk.corpus import stopwords
@@ -176,6 +175,45 @@ class BSBIIndex:
                 curr, postings, tf_list = t, postings_, tf_list_
         merged_index.append(curr, postings, tf_list)
 
+    def _compute_upper_bounds(self, index_name, k1=1.2, b=0.75):
+        """
+        Computes and stores the BM25 upper bound score for every term in the
+        merged index.
+
+        Parameters
+        ----------
+        index_name : str
+            Name of the merged index to update.
+        k1 : float
+            BM25 term frequency saturation parameter.
+        b : float
+            BM25 document length normalisation parameter.
+        """
+        with InvertedIndexReader(index_name, self.postings_encoding,
+                                directory=self.output_dir) as merged_index:
+            N = len(merged_index.doc_length)
+            if N == 0:
+                return
+            avdl = sum(merged_index.doc_length.values()) / N
+
+            for term in merged_index.terms:
+                pos, df, len_post, len_tf, _ = merged_index.postings_dict[term]
+
+                idf = math.log((N - df + 0.5) / (df + 0.5))
+
+                postings, tf_list = merged_index.get_postings_list(term)
+                max_term_weight = 0.0
+                for doc_id, tf in zip(postings, tf_list):
+                    dl = merged_index.doc_length[doc_id]
+                    numerator   = tf * (k1 + 1)
+                    denominator = tf + k1 * (1 - b + b * (dl / avdl))
+                    weight = idf * (numerator / denominator)
+                    if weight > max_term_weight:
+                        max_term_weight = weight
+
+                merged_index.postings_dict[term] = (pos, df, len_post,
+                                                    len_tf, max_term_weight)
+
     def preprocess_query(self, query):
         """
         A helper method that applies the same preprocessing pipeline used in parse_block to a
@@ -320,6 +358,124 @@ class BSBIIndex:
             docs = [(score, self.doc_id_map[doc_id]) for doc_id, score in scores.items()]
             return sorted(docs, key=lambda x: x[0], reverse=True)[:k]
 
+    def retrieve_bm25_wand(self, query, k=10, k1=1.2, b=0.75):
+        """
+        Performs Top-K retrieval using the WAND (Weak AND) algorithm with
+        BM25 scoring.
+
+        Parameters
+        ----------
+        query : str
+            Space-separated query string.
+        k : int
+            Number of top results to return.
+        k1 : float
+            BM25 term frequency saturation parameter.
+        b : float
+            BM25 document length normalisation parameter.
+
+        Returns
+        -------
+        List[Tuple[float, str]]
+            List of (score, document_name) tuples, sorted by score descending.
+        """
+        if len(self.term_id_map) == 0 or len(self.doc_id_map) == 0:
+            self.load()
+
+        with InvertedIndexReader(self.index_name, self.postings_encoding,
+                                directory=self.output_dir) as merged_index:
+            N = len(merged_index.doc_length)
+            if N == 0:
+                return []
+
+            avdl = sum(merged_index.doc_length.values()) / N
+
+            # Build per-term data structures
+            term_data = []
+            for word in self.preprocess_query(query):
+                if word not in self.term_id_map:
+                    continue
+                term_id = self.term_id_map[word]
+                if term_id not in merged_index.postings_dict:
+                    continue
+
+                _, df, _, _, upper_bound = merged_index.postings_dict[term_id]
+                idf = math.log((N - df + 0.5) / (df + 0.5))
+                postings, tf_list = merged_index.get_postings_list(term_id)
+                term_data.append({
+                    'upper_bound': upper_bound,
+                    'idf': idf,
+                    'postings': postings,
+                    'tf_list': tf_list,
+                    'ptr': 0
+                })
+
+            if not term_data:
+                return []
+
+            heap = []
+            theta = 0.0
+
+            # Collect all unique candidate doc IDs across all postings lists and sort them
+            all_doc_ids = sorted(set(
+                doc_id
+                for td in term_data
+                for doc_id in td['postings']
+            ))
+
+            for doc_id in all_doc_ids:
+                # WAND upper bound check
+                ub_sum = sum(
+                    td['upper_bound']
+                    for td in term_data
+                    if td['ptr'] < len(td['postings'])
+                    and td['postings'][td['ptr']] == doc_id
+                )
+
+                # If the upper bound sum cannot beat the current threshold,
+                # skip this document entirely, no need to compute exact score
+                if ub_sum <= theta:
+                    # Advance pointers past this doc_id
+                    for td in term_data:
+                        while td['ptr'] < len(td['postings']) \
+                            and td['postings'][td['ptr']] <= doc_id:
+                            td['ptr'] += 1
+                    continue
+
+                dl = merged_index.doc_length[doc_id]
+                exact_score = 0.0
+                for td in term_data:
+                    # Find doc_id in the term's postings list
+                    ptr = td['ptr']
+                    while ptr < len(td['postings']) \
+                        and td['postings'][ptr] < doc_id:
+                        ptr += 1
+                    if ptr < len(td['postings']) \
+                    and td['postings'][ptr] == doc_id:
+                        tf = td['tf_list'][ptr]
+                        numerator   = tf * (k1 + 1)
+                        denominator = tf + k1 * (1 - b + b * (dl / avdl))
+                        exact_score += td['idf'] * (numerator / denominator)
+
+                # Update top-K heap
+                if len(heap) < k:
+                    heapq.heappush(heap, (exact_score, doc_id))
+                elif exact_score > heap[0][0]:
+                    heapq.heapreplace(heap, (exact_score, doc_id))
+
+                # Update threshold = smallest score in current top-K
+                if len(heap) == k:
+                    theta = heap[0][0]
+
+                # Advance pointers past this doc_id
+                for td in term_data:
+                    while td['ptr'] < len(td['postings']) \
+                        and td['postings'][td['ptr']] <= doc_id:
+                        td['ptr'] += 1
+
+            docs = [(score, self.doc_id_map[doc_id]) for score, doc_id in heap]
+            return sorted(docs, key=lambda x: x[0], reverse=True)
+        
     def index(self):
         """
         Base indexing code
@@ -346,6 +502,9 @@ class BSBIIndex:
                 indices = [stack.enter_context(InvertedIndexReader(index_id, self.postings_encoding, directory=self.output_dir))
                                for index_id in self.intermediate_indices]
                 self.merge(indices, merged_index)
+
+        # Compute and store upper bounds after merge
+        self._compute_upper_bounds(self.index_name)
 
 
 if __name__ == "__main__":
