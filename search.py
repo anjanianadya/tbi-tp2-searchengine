@@ -1,6 +1,8 @@
+import os
 import time
 
 from bsbi import BSBIIndex
+from spimi import SPIMIIndex
 from compression import VBEPostings
 
 # sebelumnya sudah dilakukan indexing
@@ -9,16 +11,39 @@ BSBI_instance = BSBIIndex(data_dir = 'collection', \
                           postings_encoding = VBEPostings, \
                           output_dir = 'index')
 
+SPIMI_instance = SPIMIIndex(data_dir = 'collection', \
+                            postings_encoding = VBEPostings, \
+                            output_dir = 'index_spimi')
+SPIMI_instance.index_spimi()
+
 queries = ["alkylated with radioactive iodoacetate", \
            "psychodrama for disturbed children", \
            "lipid metabolism in toxemia and normal pregnancy"]
-           
+
+# TF-IDF retrieval check
+print("+++ TF-IDF Retrieval Check +++")       
 for query in queries:
     print("Query  : ", query)
     print("Results:")
     for (score, doc) in BSBI_instance.retrieve_tfidf(query, k = 10):
         print(f"{doc:30} {score:>.3f}")
     print()
+
+# SPIMI correctness check
+print("+++ SPIMI Sanity Check +++")
+for query in queries:
+    result_bsbi  = BSBI_instance.retrieve_bm25(query, k=10)
+    result_spimi = SPIMI_instance.retrieve_bm25(query, k=10)
+
+    # Sort by doc name to handle potential ordering differences
+    normalize = lambda results: sorted(
+        [(round(score, 6), os.path.basename(doc)) for score, doc in results],
+        key=lambda x: x[1]
+    )
+
+    assert normalize(result_bsbi) == normalize(result_spimi), f"Mismatch for query: '{query}'"
+    print(f"OK: '{query}'")
+print("All SPIMI tests passed.")
 
 # Sanity check
 print("+++ WAND Sanity Check +++")
