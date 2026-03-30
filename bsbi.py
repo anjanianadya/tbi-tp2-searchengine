@@ -88,8 +88,11 @@ class BSBIIndex:
         for filename in next(os.walk(dir))[2]:
             docname = dir + "/" + filename
             with open(docname, "r", encoding = "utf8", errors = "surrogateescape") as f:
-                for token in f.read().split():
-                    td_pairs.append((self.term_id_map[token], self.doc_id_map[docname]))
+                content = f.read().split()
+                # Register the doc before the token loop so zero-token docs are still counted in doc_length, N, and avdl
+                doc_id = self.doc_id_map[docname]
+                for token in content:
+                    td_pairs.append((self.term_id_map[token], doc_id))
 
         return td_pairs
 
@@ -222,6 +225,65 @@ class BSBIIndex:
             # Top-K
             docs = [(score, self.doc_id_map[doc_id]) for (doc_id, score) in scores.items()]
             return sorted(docs, key = lambda x: x[0], reverse = True)[:k]
+
+    def retrieve_bm25(self, query, k=10, k1=1.2, b=0.75):
+        """
+        Performs Ranked Retrieval using the BM25 scoring scheme (Term-at-a-Time).
+        Returns the top-K documents sorted descending based on BM25 score.
+
+        Parameters
+        ----------
+        query : str
+            Space-separated query string.
+        k : int
+            Num of top results to return. Default is 10.
+        k1 : float
+            Controls how quickly TF weight saturates.
+        b : float
+            Controls document length normalisation strength.
+
+        Returns
+        -------
+        List[Tuple[float, str]]
+            List of (score, document_name) tuples, sorted by score descending.
+        """
+        if len(self.term_id_map) == 0 or len(self.doc_id_map) == 0:
+            self.load()
+
+        with InvertedIndexReader(self.index_name, self.postings_encoding, directory=self.output_dir) as merged_index:
+            N = len(merged_index.doc_length)
+
+            if N == 0:
+                return []
+
+            avdl = sum(merged_index.doc_length.values()) / N
+
+            scores = {}
+            for word in query.split():
+                if word not in self.term_id_map:
+                    continue
+                term_id = self.term_id_map[word]
+
+                if term_id not in merged_index.postings_dict:
+                    continue
+
+                df = merged_index.postings_dict[term_id][1]
+
+                idf = math.log((N - df + 0.5) / (df + 0.5))
+
+                postings, tf_list = merged_index.get_postings_list(term_id)
+                for doc_id, tf in zip(postings, tf_list):
+                    dl = merged_index.doc_length[doc_id]
+                    if doc_id not in scores:
+                        scores[doc_id] = 0.0
+
+                    # BM25 term weight
+                    numerator = tf * (k1 + 1)
+                    denominator = tf + k1 * (1 - b + b * (dl / avdl))
+                    scores[doc_id] += idf * (numerator / denominator)
+
+            docs = [(score, self.doc_id_map[doc_id]) for doc_id, score in scores.items()]
+            return sorted(docs, key=lambda x: x[0], reverse=True)[:k]
 
     def index(self):
         """
